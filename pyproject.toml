@@ -18,7 +18,7 @@ dependencies = [
 pamcli = "pam_cli.cli:main"
 
 [project.optional-dependencies]
-dev = ["ruff==0.16.7", "mypy==2.3.1", "coverage==7.16.1"]
+dev = ["ruff==0.16.8", "mypy==2.3.1", "coverage==7.16.1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
