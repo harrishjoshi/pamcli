@@ -37,10 +37,12 @@ class ArgumentRulesTests(unittest.TestCase):
             ["req", "-a", ""],  # blank would match every row
             ["req", "-a", "  "],
             ["req", "-r", ""],  # a reason is required
+            ["req", "-A", "rdp"],  # only ssh, pass or both
+            ["req", "-e", "UAT", "-A", "pass"],  # files set access per IP
             *(
                 [command, option, "x"]
                 for command in ("login", "discover")
-                for option in ("--env", "-i", "--account", "-r")
+                for option in ("--env", "-i", "--account", "-r", "-A")
             ),
         ):
             with (
@@ -54,8 +56,9 @@ class ArgumentRulesTests(unittest.TestCase):
     def test_short_and_long_request_options_match(self):
         long_form = ["request", "--ips", "10.0.0.1"]
         long_form += ["--account", "db", "--hours", "2", "--reason", "patching"]
+        long_form += ["--access", "pass"]
         short_form = ["req", "-i", "10.0.0.1"]
-        short_form += ["-a", "db", "-H", "2", "-r", "patching"]
+        short_form += ["-a", "db", "-H", "2", "-r", "patching", "-A", "pass"]
         parser = build_parser()
         args = parser.parse_args(short_form)
         self.assertEqual(args, parser.parse_args(long_form))
@@ -73,6 +76,7 @@ class ArgumentRulesTests(unittest.TestCase):
             (["req", "-h"], "--env"),
             (["login", "-h"], "Log in and keep the Chromium window open"),
             (["discover", "-h"], "login_page_fields.txt"),
+            (["setup", "-h"], "safe to run again"),
             (["-V"], "pamcli "),
         ):
             with (
@@ -170,12 +174,22 @@ class MainTests(unittest.TestCase):
         self.assertEqual(code, 0)
         load.assert_called_once_with("UAT.abc")
         self.request_access.assert_called_once_with(
-            self.page, env_config, None, None, 2, None, DEFAULT_TIMEOUT_MS
+            self.page, env_config, None, None, 2, None, None, DEFAULT_TIMEOUT_MS
         )
         self.assertIn(
             "Access requested — the Chromium window shows Requests > Approved",
             self.stdout.getvalue(),
         )
+
+    def test_access_flag_is_passed_like_the_other_flags(self):
+        self.request_access.return_value = True
+        for argv in (
+            ["-i", "10.0.0.1,10.0.0.2", "-A", "both"],
+            ["-A", "pass"],  # IPs asked for
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(_run_main("req", *argv), 0)
+                self.assertEqual(self.request_access.call_args.args[6], argv[-1])
 
     def test_env_password_is_gone_before_the_browser_starts(self):
         seen_by_browser = []
@@ -186,6 +200,48 @@ class MainTests(unittest.TestCase):
             self.assertEqual(_run_main("login"), 0)
         self.assertEqual(seen_by_browser, [None])
         self.assertEqual(self.do_login.call_args.args[3], "s3cret")
+
+    def test_setup_installs_and_checks_chromium_without_pam_settings(self):
+        # Runs right after installing, before PAM_URL is configured.
+        order = []
+        with (
+            patch(
+                "pam_cli.cli.offer_to_save",
+                side_effect=lambda: order.append("offer to save settings"),
+            ),
+            patch(
+                "pam_cli.cli._install_chromium",
+                side_effect=lambda: order.append("install Chromium") or True,
+            ),
+        ):
+            self.assertEqual(_run_main("setup"), 0)
+        # Settings are offered first; Chromium is installed either way.
+        self.assertEqual(order, ["offer to save settings", "install Chromium"])
+        self._open_browser.assert_called_once()
+        self.assertTrue(self._open_browser.call_args.kwargs["headless"])
+        self._open_browser.return_value.close.assert_called_once_with()
+        self.assertIn("Chromium is ready", self.stdout.getvalue())
+        self.resolve_url.assert_not_called()
+        self.check_reachable.assert_not_called()
+        self.do_login.assert_not_called()
+
+    def test_setup_fails_when_the_download_fails(self):
+        with (
+            patch("pam_cli.cli.offer_to_save"),
+            patch("pam_cli.cli._install_chromium", return_value=False),
+        ):
+            self.assertEqual(_run_main("setup"), 1)
+        self.assertIn("ERROR: could not download Chromium", self.stderr.getvalue())
+        self._open_browser.assert_not_called()
+
+    def test_setup_fails_when_chromium_does_not_start(self):
+        self._open_browser.side_effect = PlaywrightError("missing libraries")
+        with (
+            patch("pam_cli.cli.offer_to_save"),
+            patch("pam_cli.cli._install_chromium", return_value=True),
+        ):
+            self.assertEqual(_run_main("setup"), 1)
+        self.assertIn("doesn't start (missing libraries)", self.stderr.getvalue())
 
     def test_discover_closes_browser_without_logging_in(self):
         self.assertEqual(_run_main("discover"), 0)

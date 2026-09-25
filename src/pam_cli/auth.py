@@ -51,6 +51,11 @@ def resolve_url() -> str:
             "PAM_URL is not set. Set it to the portal's login page, e.g. "
             "https://pam.example.com/login."
         )
+    return check_url(url)
+
+
+def check_url(url: str) -> str:
+    """Return the URL if it's safe to use as PAM_URL, else raise ValueError."""
     parsed = urllib.parse.urlsplit(url)
     if parsed.username or parsed.password:
         # Checked first: the URL is logged and shown in the errors below, so
