@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=83"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pamcli"
+version = "1.0.0"
+description = "Automate login to a PAM portal and request SSH-session access."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "playwright==1.62.0",
+]
+
+[project.scripts]
+pamcli = "pam_cli.cli:main"
+
+[project.optional-dependencies]
+dev = ["ruff==0.16.7", "mypy==2.3.1", "coverage==7.16.1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pam_cli = ["environments/*.json"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+
+[tool.coverage.run]
+source = ["pam_cli"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 99
+
+[tool.ruff.lint.per-file-ignores]
+# These files deliberately catch broad exceptions — they guard best-effort
+# polling probes / page-diagnostic checks that must never crash the run.
+"src/pam_cli/accounts.py" = ["BLE001"]
+"src/pam_cli/auth.py" = ["BLE001"]
+"src/pam_cli/cli.py" = ["BLE001"]
+# environments.py intentionally raises RuntimeError (not TypeError) so it can
+# carry a rich, user-facing message alongside the invalid-type detail.
+"src/pam_cli/environments.py" = ["TRY004"]
