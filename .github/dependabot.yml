@@ -1,0 +1,12 @@
+# Opens pull requests when a pinned GitHub Action (its commit SHA and
+# "# vN" comment) or a version pinned in pyproject.toml has a new release.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
