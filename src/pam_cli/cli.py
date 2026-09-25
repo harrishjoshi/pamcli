@@ -27,6 +27,7 @@ from pam_cli.environments import (
 )
 from pam_cli.logging_setup import printable, setup_logging
 from pam_cli.reachability import check_reachable, is_cert_problem
+from pam_cli.shell_rc import offer_to_save
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ def _error(message: str) -> None:
 
 def _install_chromium() -> bool:
     """Download Playwright's Chromium. False if that fails (e.g. offline)."""
-    print("Installing Playwright's Chromium (one-time)...")
+    print("Installing Playwright's Chromium (one-time)...", flush=True)
     # Use pamcli's own Python: pipx doesn't put `playwright` on PATH.
     command = [sys.executable, "-m", "playwright", "install", "chromium"]
     try:
@@ -74,7 +75,7 @@ def _install_system_deps() -> bool:
         ):
             return False
         command = [sudo, *command]
-    print("Installing system libraries Chromium needs (one-time)...")
+    print("Installing system libraries Chromium needs (one-time)...", flush=True)
     try:
         subprocess.run(command, check=True)
     except (OSError, subprocess.CalledProcessError) as exc:
@@ -83,8 +84,9 @@ def _install_system_deps() -> bool:
     return True
 
 
-def _open_browser(playwright: Playwright) -> BrowserContext:
-    """Start a visible, maximized Chromium with a fresh private session.
+def _open_browser(playwright: Playwright, headless: bool = False) -> BrowserContext:
+    """Start Chromium with a fresh private session: visible and maximized, or
+    headless (for `pamcli setup`, which only checks that it starts).
 
     Cookies stay in memory, so nothing is kept after the run. If Chromium or
     its Linux libraries are missing, they're installed once and the launch
@@ -93,7 +95,7 @@ def _open_browser(playwright: Playwright) -> BrowserContext:
     while True:
         try:
             browser = playwright.chromium.launch(
-                headless=False, args=["--start-maximized"]
+                headless=headless, args=[] if headless else ["--start-maximized"]
             )
         except PlaywrightError as exc:
             message = str(exc).lower()
@@ -124,6 +126,24 @@ def _launch_browser(playwright: Playwright) -> BrowserContext | None:
     except PlaywrightError as exc:
         _error(f"could not start Chromium ({exc}).")
         return None
+
+
+def _setup() -> int:
+    """Offer to save PAM_URL and PAM_USERNAME in the shell's start-up file, then
+    download Chromium and check that it starts, installing the Linux system
+    libraries it needs if they're missing (asking before using sudo)."""
+    offer_to_save()
+    if not _install_chromium():
+        _error("could not download Chromium; see the messages above.")
+        return 1
+    with sync_playwright() as playwright:
+        try:
+            _open_browser(playwright, headless=True).close()
+        except PlaywrightError as exc:
+            _error(f"Chromium was downloaded but doesn't start ({exc}).")
+            return 1
+    print("Chromium is ready. Next: pamcli login")
+    return 0
 
 
 def _hours_in_range(value: str) -> int:
@@ -196,6 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pamcli",
         description=__doc__,
         epilog=_examples(
+            ("pamcli setup", "save settings and download Chromium"),
             ("pamcli login", "log in and keep the Chromium window open"),
             ("pamcli req -e UAT", "request every IP in the UAT environment file"),
             ("pamcli discover", "if login stops working after a portal update"),
@@ -220,6 +241,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=_VERBOSE_HELP,
     )
     commands = parser.add_subparsers(title="commands", metavar="COMMAND")
+
+    commands.add_parser(
+        "setup",
+        help="save settings and download Chromium",
+        description="Offer to save PAM_URL and PAM_USERNAME in the shell's start-up "
+        "file,\nif they aren't set yet, then download Chromium (and, on Linux, the\n"
+        "libraries it needs). Optional; safe to run again.",
+        formatter_class=_HelpFormatter,
+        parents=[command_options],
+        allow_abbrev=False,
+    ).set_defaults(command="setup")
 
     commands.add_parser(
         "login",
@@ -356,6 +388,8 @@ def _run() -> int:
     if args.command is None:
         parser.print_help()
         return 0
+    if args.command == "setup":
+        return _setup()  # needs no PAM_* settings, so it works before they're set
     is_request = args.command == "request"
 
     try:
