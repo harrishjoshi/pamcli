@@ -8,15 +8,20 @@ from typing import TypeVar
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Locator, Page
 
+from pam_cli.access_dialog import (
+    request_access_in_dialog,
+    resolve_hours,
+    resolve_reason,
+)
 from pam_cli.config import (
     ACCESS_CELL_SELECTOR,
     ACCOUNT_NAME_CELL_SELECTOR,
+    DEFAULT_ACCESS,
     GRID_ROW_SELECTOR,
 )
 from pam_cli.environments import EnvironmentConfig, IPTarget, parse_ip_list
 from pam_cli.logging_setup import printable
 from pam_cli.polling import poll_until
-from pam_cli.ssh_session import request_ssh_access, resolve_hours, resolve_reason
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -67,11 +72,24 @@ def type_quick_filter(page: Page, filter_text: str, timeout_ms: int) -> None:
 
 
 def _shows_filter_result(texts: list[str], ip: str) -> bool:
-    """True if the rows can be the Quick filter's result for this IP: every
-    row contains it. Rows left over from the previous IP don't. A grid that
-    shows no IPs can't be checked, so it passes (and is rejected later)."""
-    return all(ip in text for text in texts) or not any(
+    """True if the rows are the Quick filter's result for this IP: every row
+    contains it. Rows left over from the previous IP don't, and neither do
+    rows the grid has drawn but not filled in yet."""
+    return all(ip in text for text in texts)
+
+
+def _shows_no_ips(texts: list[str]) -> bool:
+    """True if the rows have text but no IP address in any of them, e.g.
+    when the grid's IP column is hidden."""
+    return any(text.strip() for text in texts) and not any(
         _IPV4.search(text) for text in texts
+    )
+
+
+def _no_ips_error(ip: str) -> RuntimeError:
+    return RuntimeError(
+        f"The accounts grid shows no IP addresses, so its rows can't be "
+        f"confirmed to belong to {ip}; nothing was requested for it."
     )
 
 
@@ -84,6 +102,7 @@ def wait_for_grid_settled(page: Page, ip: str, timeout_ms: int) -> int:
     they're trusted."""
     rows = page.locator(GRID_ROW_SELECTOR)
     previous: list[int] = []
+    texts: list[str] = []
 
     def check() -> int | None:
         count = rows.count()
@@ -96,15 +115,20 @@ def wait_for_grid_settled(page: Page, ip: str, timeout_ms: int) -> int:
             except Exception as exc:
                 logger.debug("No-records check failed: %s", exc)
                 count = -1
-        elif not _shows_filter_result(rows.all_inner_texts(), ip):
-            count = -1  # still showing the previous IP's rows
+        else:
+            texts[:] = rows.all_inner_texts()
+            if not _shows_filter_result(texts, ip):
+                count = -1  # the previous IP's rows, or rows still being drawn
         settled = count >= 0 and previous == [count]
         previous[:] = [count]
         return count if settled else None
 
     settled = poll_until(check, timeout_ms, poll_interval=0.3)
     if settled is None:
+        if _shows_no_ips(texts):
+            raise _no_ips_error(ip)
         raise RuntimeError(f"The accounts grid didn't finish filtering to {ip}.")
+    logger.debug("The grid shows %d row(s) for %s", settled, ip)
     return settled
 
 
@@ -121,10 +145,7 @@ def _rows_for_ip(rows: list[Locator], ip: str, timeout_ms: int) -> list[Locator]
     so nothing is requested rather than guessing."""
     texts = [row.inner_text(timeout=timeout_ms) for row in rows]
     if texts and not any(_IPV4.search(text) for text in texts):
-        raise RuntimeError(
-            f"The accounts grid shows no IP addresses, so its rows can't be "
-            f"confirmed to belong to {ip}; nothing was requested for it."
-        )
+        raise _no_ips_error(ip)
     exact = _exact_ip(ip)
     return [row for row, text in zip(rows, texts) if exact.search(text)]
 
@@ -208,12 +229,13 @@ def select_account_and_access(
     default_account: str | None,
     hours: int | None,
     reason: str | None,
+    access: str | None,
     timeout_ms: int,
 ) -> bool:
     """Request access for each target, print a summary, then show Requests >
     Approved. True when done; False if the hours or reason prompt was
-    cancelled. Raises if no IP had any accounts, or stops at the first IP
-    that fails, after printing what was done so far.
+    cancelled, or if every IP was skipped (with a warning). Stops at the
+    first IP that fails, after printing what was done so far.
 
     As a safeguard, any tab the portal opens meanwhile (such as one offering
     to start an SSH session) is closed as soon as it opens, and any left are
@@ -221,7 +243,9 @@ def select_account_and_access(
     open_tabs = list(page.context.pages)
     page.context.on("page", _close_tab)
     try:
-        return _request_all(page, targets, default_account, hours, reason, timeout_ms)
+        return _request_all(
+            page, targets, default_account, hours, reason, access, timeout_ms
+        )
     finally:
         page.context.remove_listener("page", _close_tab)
         for tab in page.context.pages:
@@ -235,6 +259,7 @@ def _request_all(
     default_account: str | None,
     hours: int | None,
     reason: str | None,
+    access: str | None,
     timeout_ms: int,
 ) -> bool:
     open_directory_linked_accounts(page, timeout_ms)
@@ -258,11 +283,12 @@ def _request_all(
             if name is None:
                 results.append((target.ip, "—", "no accounts, skipped"))
                 continue
-            outcome = request_ssh_access(
+            outcome = request_access_in_dialog(
                 page,
                 _first_set(target.hours, hours),
                 _first_set(target.reason, reason),
                 timeout_ms,
+                access=_first_set(target.access, access, DEFAULT_ACCESS),
             )
         except Exception as exc:
             # Earlier IPs may already be requested: show them before stopping.
@@ -276,11 +302,19 @@ def _request_all(
 
     _print_results(results)
     if all(name == "—" for _, name, _ in results):
-        raise RuntimeError(
-            "No accounts found in Directory Linked Accounts for "
-            + ", ".join(t.ip for t in targets)
-            + " — nothing was requested."
+        logger.warning(
+            "No accounts found in Directory Linked Accounts for %s — nothing "
+            "was requested.",
+            ", ".join(t.ip for t in targets),
         )
+        return False
+    if all(
+        name == "—" or outcome.startswith("skipped") for _, name, outcome in results
+    ):
+        logger.warning(
+            "Every IP was skipped (see the results above) — nothing was requested."
+        )
+        return False
     show_requests(page, timeout_ms)
     return True
 
@@ -323,12 +357,14 @@ def request_access(
     account: str | None,
     hours: int | None,
     reason: str | None,
+    access: str | None,
     timeout_ms: int,
 ) -> bool:
     """Request access to the servers from -e, -i or a prompt.
 
     Command-line values override the environment file's defaults. Returns
-    True if anything was requested (False if a prompt was cancelled)."""
+    True if anything was requested (False if a prompt was cancelled or every
+    IP was skipped)."""
     targets: list[IPTarget] | None
     if env_config:
         targets = env_config.targets
@@ -341,4 +377,6 @@ def request_access(
         targets = _prompt_for_ips()
         if targets is None:
             return False
-    return select_account_and_access(page, targets, account, hours, reason, timeout_ms)
+    return select_account_and_access(
+        page, targets, account, hours, reason, access, timeout_ms
+    )

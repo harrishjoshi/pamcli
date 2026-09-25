@@ -156,10 +156,22 @@ class WaitForGridSettledTests(unittest.TestCase):
         self.assertEqual(wait_for_grid_settled(page, "10.0.0.2", 1000), 2)
         self.assertEqual(page.locator.return_value.all_inner_texts.call_count, 4)
 
-    def test_a_grid_without_ips_can_settle(self, _sleep):
-        # It's rejected later, with a clearer error than a timeout.
-        page = self._page([1, 1], [["app Access"]] * 2)
-        self.assertEqual(wait_for_grid_settled(page, "10.0.0.1", 1000), 1)
+    def test_rows_still_being_drawn_are_not_settled(self, _sleep):
+        # The rows appear before their cells are filled in.
+        blank, filled = ["", ""], ["a 10.0.0.1", "b 10.0.0.1"]
+        page = self._page([2] * 4, [blank, blank, filled, filled])
+        self.assertEqual(wait_for_grid_settled(page, "10.0.0.1", 1000), 2)
+        self.assertEqual(page.locator.return_value.all_inner_texts.call_count, 4)
+
+    def test_a_grid_without_ips_gets_a_clear_error(self, _sleep):
+        # e.g. the IP column is hidden: say so rather than "didn't finish".
+        page = self._page([1], lambda: ["app Access"])
+        with (
+            # One check, then the time is up.
+            patch("pam_cli.accounts.poll_until", new=lambda check, *_, **__: check()),
+            self.assertRaisesRegex(RuntimeError, "shows no IP addresses"),
+        ):
+            wait_for_grid_settled(page, "10.0.0.1", 1000)
 
     def test_no_records_message_means_zero(self, _sleep):
         page = MagicMock()
@@ -235,7 +247,7 @@ class TabClosingTests(unittest.TestCase):
                     page,
                     users_tab,
                     select_account_and_access(
-                        page, [IPTarget(ip="10.0.0.1")], None, 4, "x", 1000
+                        page, [IPTarget(ip="10.0.0.1")], None, 4, "x", None, 1000
                     ),
                 )
             finally:
@@ -279,7 +291,9 @@ class QuickFilterTests(unittest.TestCase):
 
 
 class SelectAccountAndAccessTests(unittest.TestCase):
-    def _run(self, targets, found="svc.app0", account="svc.app0"):
+    def _run(
+        self, targets, found="svc.app0", account="svc.app0", access=None, outcomes=None
+    ):
         with (
             patch("sys.stdout", new_callable=io.StringIO) as self.output,
             patch("pam_cli.accounts.open_directory_linked_accounts"),
@@ -293,12 +307,14 @@ class SelectAccountAndAccessTests(unittest.TestCase):
                 return_value=found,
             ) as select,
             patch(
-                "pam_cli.accounts.request_ssh_access", return_value="requested"
+                "pam_cli.accounts.request_access_in_dialog",
+                side_effect=outcomes,
+                return_value="requested",
             ) as start,
             patch("pam_cli.accounts.show_requests") as self.show_requests,
         ):
             result = select_account_and_access(
-                MagicMock(), targets, account, None, None, 1000
+                MagicMock(), targets, account, None, None, access, 1000
             )
         return result, select, start
 
@@ -316,6 +332,25 @@ class SelectAccountAndAccessTests(unittest.TestCase):
         self.assertEqual(
             [c.args[1:3] for c in start.call_args_list], [(4, "UAT"), (2, "db")]
         )
+
+    def test_access_per_target_beats_the_run_value(self):
+        # Both inputs can't come from the CLI at once: only an environment
+        # file sets a target's access, and -e forbids -A. This pins the
+        # function's own precedence, all three levels of it.
+        targets = [
+            IPTarget(ip="10.0.0.1"),
+            IPTarget(ip="10.0.0.2", access="pass"),
+            IPTarget(ip="10.0.0.3", access="both"),
+        ]
+        for access, expected in (
+            (None, ["ssh", "pass", "both"]),  # unset means SSH only
+            ("pass", ["pass", "pass", "both"]),
+        ):
+            with self.subTest(access=access):
+                _, _, start = self._run(targets, access=access)
+                self.assertEqual(
+                    [c.kwargs["access"] for c in start.call_args_list], expected
+                )
 
     def test_no_prompt_when_every_target_sets_its_own_values(self):
         targets = [IPTarget(ip="10.0.0.1", hours=2, reason="db")]
@@ -339,6 +374,40 @@ class SelectAccountAndAccessTests(unittest.TestCase):
             ],
         )
 
+    def test_an_ip_without_the_access_type_is_skipped_and_the_batch_carries_on(self):
+        targets = [IPTarget(ip=f"10.0.0.{n}") for n in (1, 2, 3)]
+        skipped = "skipped (no passkey access for this account)"
+        _, _, start = self._run(
+            targets,
+            found="app",
+            account=None,
+            outcomes=["requested (passkey)", skipped, "requested (passkey)"],
+        )
+        self.assertEqual(start.call_count, 3)
+        self.show_requests.assert_called_once()
+        self.assertEqual(
+            self.output.getvalue().splitlines()[-3:],
+            [
+                "  10.0.0.1  app  requested (passkey)",
+                f"  10.0.0.2  app  {skipped}",
+                "  10.0.0.3  app  requested (passkey)",
+            ],
+        )
+
+    def test_warns_when_every_ip_was_skipped(self):
+        # Some without accounts, the rest without the access type asked for.
+        targets = [IPTarget(ip="10.0.0.1"), IPTarget(ip="10.0.0.2")]
+        with self.assertLogs("pam_cli", "WARNING") as logs:
+            result, _, _ = self._run(
+                targets,
+                found=[None, "app"],
+                account=None,
+                outcomes=["skipped (no passkey access for this account)"],
+            )
+        self.assertFalse(result)  # ends like a login-only run
+        self.assertIn("Every IP was skipped", logs.output[-1])
+        self.show_requests.assert_not_called()
+
     def test_cancelling_a_prompt_keeps_the_login(self):
         for error in (KeyboardInterrupt, EOFError):
             with (
@@ -349,7 +418,13 @@ class SelectAccountAndAccessTests(unittest.TestCase):
                 patch("builtins.print"),
             ):
                 result = select_account_and_access(
-                    MagicMock(), [IPTarget(ip="10.0.0.1")], None, None, None, 1000
+                    MagicMock(),
+                    [IPTarget(ip="10.0.0.1")],
+                    None,
+                    None,
+                    None,
+                    None,
+                    1000,
                 )
             self.assertFalse(result)
             select.assert_not_called()  # nothing was requested
@@ -374,7 +449,7 @@ class SelectAccountAndAccessTests(unittest.TestCase):
         self._run([IPTarget(ip="10.0.0.1")], found="app\x1b[2K")
         self.assertIn("app\\x1b[2K  requested", self.output.getvalue())
 
-    def test_raises_when_no_target_had_accounts(self):
+    def test_warns_when_no_target_had_accounts(self):
         # A batch where every IP is skipped must not look like a success.
         for targets in (
             [IPTarget(ip="10.0.0.1")],
@@ -382,11 +457,12 @@ class SelectAccountAndAccessTests(unittest.TestCase):
         ):
             with (
                 self.subTest(count=len(targets)),
-                self.assertRaisesRegex(
-                    RuntimeError, "No accounts found.* for 10.0.0.1"
-                ),
+                self.assertLogs("pam_cli", "WARNING") as logs,
             ):
-                self._run(targets, found=[None] * len(targets))
+                result, _, _ = self._run(targets, found=[None] * len(targets))
+            self.assertFalse(result)
+            self.assertRegex(logs.output[-1], "No accounts found.* for 10.0.0.1")
+            self.show_requests.assert_not_called()
 
 
 @patch("pam_cli.accounts.select_account_and_access", return_value=True)
@@ -395,23 +471,28 @@ class RequestAccessTests(unittest.TestCase):
         env = EnvironmentConfig(
             targets=[IPTarget(ip="10.0.0.1")], hours=6, reason="file", account="db"
         )
-        self.assertTrue(request_access(MagicMock(), env, None, None, 2, None, 1000))
-        _, targets, account, hours, reason, _ = select.call_args.args
+        self.assertTrue(
+            request_access(MagicMock(), env, None, None, 2, None, "pass", 1000)
+        )
+        _, targets, account, hours, reason, access, _ = select.call_args.args
         self.assertEqual(
-            (targets, account, hours, reason), (env.targets, "db", 2, "file")
+            (targets, account, hours, reason, access),
+            (env.targets, "db", 2, "file", "pass"),
         )
 
     def test_ips_from_the_command_line_skip_the_prompt(self, select):
         ips = [IPTarget(ip="10.0.0.1")]
         with patch("pam_cli.accounts._prompt_for_ips") as prompt:
-            self.assertTrue(request_access(MagicMock(), None, ips, None, 2, "x", 1000))
+            self.assertTrue(
+                request_access(MagicMock(), None, ips, None, 2, "x", None, 1000)
+            )
         prompt.assert_not_called()
         self.assertIs(select.call_args.args[1], ips)
 
     def test_prompt_cancel_stays_logged_in(self, select):
         with patch("pam_cli.accounts._prompt_for_ips", return_value=None):
             self.assertFalse(
-                request_access(MagicMock(), None, None, None, None, None, 1000)
+                request_access(MagicMock(), None, None, None, None, None, None, 1000)
             )
         select.assert_not_called()
 
