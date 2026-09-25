@@ -11,15 +11,21 @@ With Python 3.10+ and pipx installed, run this in a clone of this repository:
 
 ```bash
 pipx install .
+pamcli setup
 ```
 
-The first time it runs, pamcli downloads the Chromium browser it logs
-in with.
+Run `pamcli setup` to save the settings and download Chromium
+(optional; safe to run again). It:
+
+- offers to save `PAM_URL` and `PAM_USERNAME` in `~/.zshrc` or `~/.bashrc`,
+  if they aren't set yet;
+- downloads Chromium (and, on Linux, the libraries it needs).
 
 ## Set up
 
 pamcli reads its settings from environment variables. On Linux and macOS,
-add them to `~/.bashrc` or `~/.zshrc` so they're set in every terminal:
+add them to `~/.bashrc` or `~/.zshrc` so they're set in every terminal
+(`pamcli setup` can add `PAM_URL` and `PAM_USERNAME`):
 
 ```bash
 export PAM_URL='https://pam.example.com/login'                 # the portal's login page

@@ -73,6 +73,7 @@ class ArgumentRulesTests(unittest.TestCase):
             (["req", "-h"], "--env"),
             (["login", "-h"], "Log in and keep the Chromium window open"),
             (["discover", "-h"], "login_page_fields.txt"),
+            (["setup", "-h"], "safe to run again"),
             (["-V"], "pamcli "),
         ):
             with (
@@ -186,6 +187,48 @@ class MainTests(unittest.TestCase):
             self.assertEqual(_run_main("login"), 0)
         self.assertEqual(seen_by_browser, [None])
         self.assertEqual(self.do_login.call_args.args[3], "s3cret")
+
+    def test_setup_installs_and_checks_chromium_without_pam_settings(self):
+        # Runs right after installing, before PAM_URL is configured.
+        order = []
+        with (
+            patch(
+                "pam_cli.cli.offer_to_save",
+                side_effect=lambda: order.append("offer to save settings"),
+            ),
+            patch(
+                "pam_cli.cli._install_chromium",
+                side_effect=lambda: order.append("install Chromium") or True,
+            ),
+        ):
+            self.assertEqual(_run_main("setup"), 0)
+        # Settings are offered first; Chromium is installed either way.
+        self.assertEqual(order, ["offer to save settings", "install Chromium"])
+        self._open_browser.assert_called_once()
+        self.assertTrue(self._open_browser.call_args.kwargs["headless"])
+        self._open_browser.return_value.close.assert_called_once_with()
+        self.assertIn("Chromium is ready", self.stdout.getvalue())
+        self.resolve_url.assert_not_called()
+        self.check_reachable.assert_not_called()
+        self.do_login.assert_not_called()
+
+    def test_setup_fails_when_the_download_fails(self):
+        with (
+            patch("pam_cli.cli.offer_to_save"),
+            patch("pam_cli.cli._install_chromium", return_value=False),
+        ):
+            self.assertEqual(_run_main("setup"), 1)
+        self.assertIn("ERROR: could not download Chromium", self.stderr.getvalue())
+        self._open_browser.assert_not_called()
+
+    def test_setup_fails_when_chromium_does_not_start(self):
+        self._open_browser.side_effect = PlaywrightError("missing libraries")
+        with (
+            patch("pam_cli.cli.offer_to_save"),
+            patch("pam_cli.cli._install_chromium", return_value=True),
+        ):
+            self.assertEqual(_run_main("setup"), 1)
+        self.assertIn("doesn't start (missing libraries)", self.stderr.getvalue())
 
     def test_discover_closes_browser_without_logging_in(self):
         self.assertEqual(_run_main("discover"), 0)

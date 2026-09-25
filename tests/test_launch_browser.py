@@ -38,6 +38,16 @@ class OpenBrowserTests(unittest.TestCase):
         )
         self.assertTrue(context.arguments["no_viewport"])  # page fills the window
 
+    def test_headless_for_the_setup_check(self):
+        playwright = MagicMock()
+        _open_browser(playwright, headless=True)
+        launch = playwright.chromium.launch
+        launched = inspect.signature(BrowserType.launch).bind(
+            None, *launch.call_args.args, **launch.call_args.kwargs
+        )
+        self.assertTrue(launched.arguments["headless"])
+        self.assertEqual(launched.arguments["args"], [])  # nothing to maximize
+
 
 class OpenBrowserRetryTests(unittest.TestCase):
     def _open(self, launch_results, deps_ok=True, chromium_ok=True):
