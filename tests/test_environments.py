@@ -39,6 +39,7 @@ class LoadEnvironmentTests(unittest.TestCase):
                 "ips": [
                     "10.0.0.1",
                     {"ip": "10.0.0.2", "hours": MAX_SESSION_HOURS, "account": "db"},
+                    {"ip": "10.0.0.3", "access": "pass"},
                 ],
             },
         )
@@ -49,6 +50,7 @@ class LoadEnvironmentTests(unittest.TestCase):
             [
                 IPTarget(ip="10.0.0.1"),
                 IPTarget(ip="10.0.0.2", hours=MAX_SESSION_HOURS, account="db"),
+                IPTarget(ip="10.0.0.3", access="pass"),
             ],
         )
 
@@ -72,6 +74,17 @@ class LoadEnvironmentTests(unittest.TestCase):
                 "ips": [{"ip": "10.0.0.1", "account": " "}]
             },
             '"reason" must not be blank': {"ips": ["10.0.0.1"], "reason": ""},
+            "\"access\" must be one of 'ssh', 'pass', 'both', got 'rdp'": {
+                "ips": [{"ip": "10.0.0.1", "access": "rdp"}]
+            },
+            '"access" must be one of .*, got True': {
+                "ips": [{"ip": "10.0.0.1", "access": True}]
+            },
+            # Access is per server, never for the whole file.
+            '"access" can only be set on each IP': {
+                "ips": ["10.0.0.1"],
+                "access": "pass",
+            },
             # Typos are errors, not silently ignored.
             "unknown key\\(s\\) 'hour'": {"ips": ["10.0.0.1"], "hour": 2},
             "unknown key\\(s\\) 'acount'": {

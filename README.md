@@ -1,7 +1,7 @@
 # pamcli
 
-Logs into a PAM (privileged access management) portal and requests SSH
-access to servers.
+Logs into a PAM (privileged access management) portal and requests SSH or
+passkey access to servers.
 Every run starts fresh — nothing carries over from an earlier run, and
 the password is never saved.
 
@@ -67,9 +67,26 @@ pamcli req -i 10.0.0.1 -H 2   # request one IP for 2 hours
 | `-a`, `--account NAME` | PAM account to request, e.g. `svc.app01` |
 | `-H`, `--hours N` | Session length, 1–12 hours |
 | `-r`, `--reason TEXT` | Reason for the access request |
+| `-A`, `--access TYPE` | What to request: `ssh` (default), `pass` or `both` (not together with `-e`) |
 
 Add `-v` to any command for detailed logs. `pamcli -h` and `pamcli req -h`
 print the full help.
+
+Access types, for `-A` or `"access"` in an environment file:
+
+- `ssh` (default): SSH only. pamcli also turns the passkey off if the
+  portal has it on already.
+- `pass`: the passkey only.
+- `both`: the passkey and SSH.
+
+Not every account offers every type. If the one asked for is missing,
+pamcli skips that IP and carries on with the others. If every IP is
+skipped, pamcli warns that nothing was requested and stays logged in.
+
+```bash
+pamcli req -i 10.0.0.1,10.0.0.2 -A pass   # the passkey only, for both IPs
+pamcli req -i 10.0.0.1 -A both            # the passkey and SSH
+```
 
 ## Environment files
 
@@ -98,7 +115,8 @@ The file looks like this:
   "reason": "UAT testing",
   "ips": [
     "198.51.100.10",
-    { "ip": "198.51.100.11", "hours": 2, "reason": "Quick check", "account": "svc.app01" }
+    { "ip": "198.51.100.11", "hours": 2, "reason": "Quick check", "account": "svc.app01", "access": "pass" },
+    { "ip": "198.51.100.12", "access": "both" }
   ]
 }
 ```
@@ -107,6 +125,8 @@ Replace the IPs with the target servers, then run `pamcli req -e UAT`.
 
 - Top-level `hours`, `reason` and `account` apply to every IP. An IP can
   set its own, which always wins.
+- `"access"` can only be set on each IP, not for the whole file, and `-A`
+  can't be used with `-e`.
 - Command-line options replace the top-level values.
 - pamcli asks once per run for anything still unset (hours, reason).
 - To keep several projects separate, name files like `UAT.abc.json` and

@@ -1,5 +1,6 @@
 """Environment files: the servers (IPs) to request together, with
-optional hours, reason and account for all or some of them."""
+optional hours, reason and account for all or some of them, and the
+access type per IP."""
 
 import importlib.resources
 import ipaddress
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pam_cli.config import MAX_SESSION_HOURS
+from pam_cli.config import ACCESS_TYPES, MAX_SESSION_HOURS
 from pam_cli.paths import config_dir
 
 
@@ -35,6 +36,7 @@ class IPTarget:
     hours: int | None = None
     reason: str | None = None
     account: str | None = None
+    access: str | None = None
 
 
 @dataclass
@@ -77,6 +79,17 @@ def _optional_fields(
     return {"hours": hours, "reason": reason, "account": account}
 
 
+def _checked_access(entry: dict[str, Any], where: str) -> str | None:
+    """Return an IP entry's "access", if set, after checking it."""
+    access = entry.get("access")
+    if access is not None and access not in ACCESS_TYPES:
+        raise RuntimeError(
+            f'{where}: "access" must be one of '
+            f"{', '.join(map(repr, ACCESS_TYPES))}, got {access!r}."
+        )
+    return access
+
+
 def check_ip(value: str) -> str:
     """Return the value if it's a plain IPv4 address, else raise ValueError.
 
@@ -106,7 +119,12 @@ def _parse_ip_entry(entry: object, path: Path) -> IPTarget:
                 f'{path}: each entry in "ips" must have a non-empty string "ip".'
             )
         _checked_ip(ip, path)
-        return IPTarget(ip=ip, **_optional_fields(entry, f"{path} ({ip})", {"ip"}))
+        where = f"{path} ({ip})"
+        return IPTarget(
+            ip=ip,
+            access=_checked_access(entry, where),
+            **_optional_fields(entry, where, {"ip", "access"}),
+        )
     raise RuntimeError(
         f'{path}: each entry in "ips" must be a non-empty string or an object '
         'with an "ip" field.'
@@ -153,6 +171,10 @@ def load_environment(label: str) -> EnvironmentConfig:
     raw_ips = data.get("ips")
     if not isinstance(raw_ips, list) or not raw_ips:
         raise RuntimeError(f'{path} must have a non-empty "ips" list.')
+    if "access" in data:
+        raise RuntimeError(
+            f'{path}: "access" can only be set on each IP, not for the whole file.'
+        )
 
     return EnvironmentConfig(
         targets=[_parse_ip_entry(entry, path) for entry in raw_ips],

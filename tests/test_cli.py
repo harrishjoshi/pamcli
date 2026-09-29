@@ -37,10 +37,12 @@ class ArgumentRulesTests(unittest.TestCase):
             ["req", "-a", ""],  # blank would match every row
             ["req", "-a", "  "],
             ["req", "-r", ""],  # a reason is required
+            ["req", "-A", "rdp"],  # only ssh, pass or both
+            ["req", "-e", "UAT", "-A", "pass"],  # files set access per IP
             *(
                 [command, option, "x"]
                 for command in ("login", "discover")
-                for option in ("--env", "-i", "--account", "-r")
+                for option in ("--env", "-i", "--account", "-r", "-A")
             ),
         ):
             with (
@@ -54,8 +56,9 @@ class ArgumentRulesTests(unittest.TestCase):
     def test_short_and_long_request_options_match(self):
         long_form = ["request", "--ips", "10.0.0.1"]
         long_form += ["--account", "db", "--hours", "2", "--reason", "patching"]
+        long_form += ["--access", "pass"]
         short_form = ["req", "-i", "10.0.0.1"]
-        short_form += ["-a", "db", "-H", "2", "-r", "patching"]
+        short_form += ["-a", "db", "-H", "2", "-r", "patching", "-A", "pass"]
         parser = build_parser()
         args = parser.parse_args(short_form)
         self.assertEqual(args, parser.parse_args(long_form))
@@ -171,12 +174,22 @@ class MainTests(unittest.TestCase):
         self.assertEqual(code, 0)
         load.assert_called_once_with("UAT.abc")
         self.request_access.assert_called_once_with(
-            self.page, env_config, None, None, 2, None, DEFAULT_TIMEOUT_MS
+            self.page, env_config, None, None, 2, None, None, DEFAULT_TIMEOUT_MS
         )
         self.assertIn(
             "Access requested — the Chromium window shows Requests > Approved",
             self.stdout.getvalue(),
         )
+
+    def test_access_flag_is_passed_like_the_other_flags(self):
+        self.request_access.return_value = True
+        for argv in (
+            ["-i", "10.0.0.1,10.0.0.2", "-A", "both"],
+            ["-A", "pass"],  # IPs asked for
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(_run_main("req", *argv), 0)
+                self.assertEqual(self.request_access.call_args.args[6], argv[-1])
 
     def test_env_password_is_gone_before_the_browser_starts(self):
         seen_by_browser = []
