@@ -1,4 +1,4 @@
-"""Log into a PAM portal and request SSH access to servers."""
+"""Log into a PAM portal and request SSH or passkey access to servers."""
 
 import argparse
 import logging
@@ -15,6 +15,7 @@ from playwright.sync_api import Error as PlaywrightError
 from pam_cli.accounts import request_access
 from pam_cli.auth import do_login, resolve_url, take_env_password
 from pam_cli.config import (
+    ACCESS_TYPES,
     DEFAULT_TIMEOUT_MS,
     MAX_SESSION_HOURS,
 )
@@ -265,8 +266,8 @@ def build_parser() -> argparse.ArgumentParser:
     request = commands.add_parser(
         "request",
         aliases=["req"],
-        help="log in, then request SSH access to servers",
-        description="Log in, then request SSH access to servers.\n"
+        help="log in, then request access to servers",
+        description="Log in, then request SSH or passkey access to servers.\n"
         "Without -e or -i, pamcli asks for the IPs.",
         epilog=_examples(
             ("pamcli req", "asks for IPs"),
@@ -312,6 +313,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=_non_blank,
         metavar="TEXT",
         help="reason for the access request (asked if not set)",
+    )
+    request.add_argument(
+        "-A",
+        "--access",
+        choices=ACCESS_TYPES,
+        metavar="TYPE",
+        help="ssh (default), pass or both; not with -e",
     )
 
     commands.add_parser(
@@ -391,6 +399,9 @@ def _run() -> int:
     if args.command == "setup":
         return _setup()  # needs no PAM_* settings, so it works before they're set
     is_request = args.command == "request"
+    # Environment files set access on each IP, never for the whole file.
+    if is_request and args.env and args.access is not None:
+        parser.error('-A/--access can\'t be used with -e; set "access" on each IP')
 
     try:
         timeout_ms = _timeout_ms()
@@ -449,6 +460,7 @@ def _run() -> int:
                     args.account,
                     args.hours,
                     args.reason,
+                    args.access,
                     timeout_ms,
                 )
                 if is_request

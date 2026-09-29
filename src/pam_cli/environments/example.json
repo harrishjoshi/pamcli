@@ -7,7 +7,9 @@
       "ip": "198.51.100.11",
       "hours": 2,
       "reason": "Quick check",
-      "account": "svc.app01"
-    }
+      "account": "svc.app01",
+      "access": "pass"
+    },
+    { "ip": "198.51.100.12", "access": "both" }
   ]
 }

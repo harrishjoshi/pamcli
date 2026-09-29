@@ -36,5 +36,13 @@ REQUEST_SCOPE = "ps-request-access"
 # that request is valid.
 EXISTING_REQUEST_TEXT = "An existing active request for this account can be reused"
 
+# Labels of the Submit Request tab's access switches.
+SSH_SWITCH_NAME = "SSH Session"
+PASSKEY_SWITCH_NAME = "Password"
+
+# Access types for -A and "access": ssh, pass (the passkey only), both.
+ACCESS_TYPES = ("ssh", "pass", "both")
+DEFAULT_ACCESS = "ssh"
+
 DEFAULT_SESSION_HOURS = 12
 MAX_SESSION_HOURS = 12
