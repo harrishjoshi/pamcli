@@ -12,7 +12,7 @@ from playwright.sync_api import Locator, Page
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from pam_cli.blocker import install_input_blocker, remove_input_blocker
-from pam_cli.config import TEXT, TOTP_INPUT_SELECTOR
+from pam_cli.config import DASHBOARD_CARD_HEADING, TEXT, TOTP_INPUT_SELECTOR
 from pam_cli.paths import write_private
 from pam_cli.polling import poll_until
 
@@ -123,6 +123,23 @@ def is_logged_in(page: Page) -> bool:
         return False
 
 
+def _leave_dashboard_landing(page: Page) -> bool:
+    """If the portal is showing its app dashboard instead of the vault,
+    click the vault's card and return True. Users who land on the vault
+    directly never see the dashboard, so for them this does nothing."""
+    heading = page.get_by_role("heading", name=DASHBOARD_CARD_HEADING)
+    card = page.get_by_role("link").filter(has=heading).first
+    try:
+        if not card.is_visible():
+            return False
+        logger.debug("Opening the vault from the dashboard")
+        card.click()
+    except PlaywrightError as exc:
+        logger.debug("Dashboard card check failed: %s", exc)
+        return False
+    return True
+
+
 def wait_for_totp_or_success(page: Page, timeout_ms: int) -> str:
     """Wait for the TOTP screen ('totp') or the portal itself ('success')."""
     logger.debug("Waiting for the TOTP screen or the portal")
@@ -135,6 +152,7 @@ def wait_for_totp_or_success(page: Page, timeout_ms: int) -> str:
                 return "totp"
         except Exception as exc:
             logger.debug("TOTP heading check failed: %s", exc)
+        _leave_dashboard_landing(page)  # then check again
         return None
 
     outcome = poll_until(check, timeout_ms)
@@ -148,7 +166,14 @@ def wait_for_totp_or_success(page: Page, timeout_ms: int) -> str:
 
 def wait_for_login_success(page: Page, timeout_ms: int) -> None:
     logger.debug("Waiting for the portal")
-    if poll_until(lambda: is_logged_in(page) or None, timeout_ms) is None:
+
+    def check() -> bool | None:
+        if is_logged_in(page):
+            return True
+        _leave_dashboard_landing(page)
+        return None
+
+    if poll_until(check, timeout_ms) is None:
         raise PlaywrightTimeoutError(
             f"Did not detect a successful login in time. Last seen URL: {page.url}"
         )
