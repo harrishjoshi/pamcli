@@ -15,9 +15,13 @@ TEXT = {
     "totp_submit_button": "Submit",
 }
 
-# Some users land on an app dashboard after login instead of the vault. The
-# card that opens the vault is the one whose heading has the word
-# "password"; the dashboard's other cards don't.
+# Some users land on the portal's app dashboard after login instead of the
+# vault. The vault's Accounts page is the same site with this URL hash.
+VAULT_ACCOUNTS_HASH = "!/ps/portal?tab=accounts"
+
+# If the dashboard can't be left by its address, the card that opens the
+# vault is the one whose heading has the word "password"; the other cards
+# don't.
 DASHBOARD_CARD_HEADING = re.compile(r"\bpassword\b", re.IGNORECASE)
 
 # The TOTP field. Its id changes on every page load, so it's found by its

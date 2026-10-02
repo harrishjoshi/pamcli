@@ -12,6 +12,7 @@ from pam_cli.auth import (
     FAILURE_SCREENSHOT_PATH,
     TOTP_ATTEMPTS,
     _fail,
+    _is_app_dashboard,
     _totp_accepted,
     dismiss_authorized_use_banner,
     do_login,
@@ -24,7 +25,12 @@ from pam_cli.auth import (
     wait_for_login_success,
     wait_for_totp_or_success,
 )
-from pam_cli.config import DASHBOARD_CARD_HEADING, TEXT, TOTP_INPUT_SELECTOR
+from pam_cli.config import (
+    DASHBOARD_CARD_HEADING,
+    TEXT,
+    TOTP_INPUT_SELECTOR,
+    VAULT_ACCOUNTS_HASH,
+)
 
 URL = "https://pam.example/login"
 
@@ -226,20 +232,25 @@ class TotpAcceptedTests(unittest.TestCase):
             patch("pam_cli.auth.is_logged_in", return_value=logged_in),
             patch("pam_cli.polling.time.monotonic", side_effect=[0, 0, 99, 99]),
             patch("pam_cli.auth.wait_for_login_success") as wait,
+            patch("pam_cli.auth._leave_dashboard_landing") as leave,
         ):
-            return _totp_accepted(page, field, 5000), wait
+            return _totp_accepted(page, field, 5000), wait, leave
 
     def test_logged_in(self, _sleep):
-        self.assertEqual(self._check(True, True)[0], True)
+        accepted, _wait, leave = self._check(True, True)
+        self.assertTrue(accepted)
+        leave.assert_not_called()
 
     def test_rejected_while_the_totp_field_is_still_shown(self, _sleep):
-        accepted, wait = self._check(False, True)
+        accepted, wait, leave = self._check(False, True)
         self.assertFalse(accepted)
         wait.assert_not_called()
+        leave.assert_not_called()
 
     def test_page_moved_on_waits_for_the_portal(self, _sleep):
-        accepted, wait = self._check(False, False)
+        accepted, wait, leave = self._check(False, False)
         self.assertTrue(accepted)
+        leave.assert_called_once()
         wait.assert_called_once()
 
 
@@ -423,6 +434,64 @@ class DashboardLandingTests(unittest.TestCase):
         page.get_by_text.return_value.first.is_visible.return_value = False
         return page, card, link, heading
 
+    def test_dashboard_urls(self):
+        home = "https://pam.example/portal/#!/dashboard"
+        accounts = f"https://pam.example/portal/#{VAULT_ACCOUNTS_HASH}"
+        self.assertTrue(_is_app_dashboard(home))
+        self.assertTrue(
+            _is_app_dashboard("https://pam.example/Portal/index.html#!/dashboard/")
+        )
+        self.assertFalse(_is_app_dashboard(accounts))
+        self.assertFalse(_is_app_dashboard(URL))
+
+    def test_a_dashboard_url_opens_the_vault_accounts(self):
+        for wait in (wait_for_totp_or_success, wait_for_login_success):
+            with self.subTest(wait.__name__), patch("pam_cli.polling.time.sleep"):
+                page, card, _, _ = self._page(
+                    accounts_tab=[False, True], card_visible=[]
+                )
+                page.url = "https://pam.example/portal/#!/dashboard"
+                wait(page, 1000)
+                page.evaluate.assert_called_once_with(ANY, f"#{VAULT_ACCOUNTS_HASH}")
+                card.dispatch_event.assert_not_called()
+
+    def test_a_failed_dashboard_navigation_tries_the_card(self):
+        with patch("pam_cli.polling.time.sleep"):
+            page, card, _, _ = self._page(
+                accounts_tab=[False, True], card_visible=[True]
+            )
+            page.url = "https://pam.example/portal/#!/dashboard"
+            page.evaluate.side_effect = PlaywrightError("nav")
+            wait_for_login_success(page, 1000)
+        card.dispatch_event.assert_called_once_with("click")
+
+    def test_the_vault_is_opened_once(self):
+        # Clicking the card on every poll reloads Accounts, so the tab takes
+        # much longer to appear.
+        with patch("pam_cli.polling.time.sleep"):
+            page, card, _, _ = self._page(
+                accounts_tab=[False, False, False, True],
+                card_visible=[True, True, True],
+            )
+            wait_for_login_success(page, 1000)
+        card.dispatch_event.assert_called_once_with("click")
+
+    def test_an_opened_dashboard_is_not_clicked_again(self):
+        with patch("pam_cli.polling.time.sleep"):
+            page, card, _, _ = self._page(
+                accounts_tab=[False, False, False, True],
+                card_visible=[True, True, True],
+            )
+            page.url = "https://pam.example/portal/#!/dashboard"
+
+            def _leave_home(*_args: object) -> None:
+                page.url = f"https://pam.example/portal/#{VAULT_ACCOUNTS_HASH}"
+
+            page.evaluate.side_effect = _leave_home
+            wait_for_login_success(page, 1000)
+        page.evaluate.assert_called_once_with(ANY, f"#{VAULT_ACCOUNTS_HASH}")
+        card.dispatch_event.assert_not_called()
+
     def test_a_dashboard_landing_opens_the_vault(self):
         for wait in (wait_for_totp_or_success, wait_for_login_success):
             with self.subTest(wait.__name__), patch("pam_cli.polling.time.sleep"):
@@ -430,7 +499,7 @@ class DashboardLandingTests(unittest.TestCase):
                     accounts_tab=[False, True], card_visible=[True]
                 )
                 wait(page, 1000)
-                card.click.assert_called_once_with()
+                card.dispatch_event.assert_called_once_with("click")
                 link.filter.assert_called_with(has=heading)
                 page.get_by_role.assert_any_call("heading", name=DASHBOARD_CARD_HEADING)
 
@@ -445,7 +514,7 @@ class DashboardLandingTests(unittest.TestCase):
         page, card, _, _ = self._page(accounts_tab=[True], card_visible=[])
         self.assertEqual(wait_for_totp_or_success(page, 1000), "success")
         card.is_visible.assert_not_called()
-        card.click.assert_not_called()
+        card.dispatch_event.assert_not_called()
 
     def test_a_failing_dashboard_check_means_not_yet(self):
         with patch("pam_cli.polling.time.sleep"):
@@ -454,7 +523,22 @@ class DashboardLandingTests(unittest.TestCase):
                 card_visible=[PlaywrightError("detached"), True],
             )
             wait_for_login_success(page, 1000)
-        card.click.assert_called_once_with()
+        card.dispatch_event.assert_called_once_with("click")
+
+    def test_a_dashboard_during_the_totp_wait_opens_the_vault(self):
+        # A correct code that lands on the dashboard used to sit for the whole
+        # reject window, because that wait only looked for the Accounts tab.
+        page, _, _, _ = self._page(accounts_tab=[False, True], card_visible=[])
+        page.url = "https://pam.example/portal/#!/dashboard"
+        totp_field = MagicMock()
+        totp_field.is_visible.return_value = False
+        with (
+            patch("pam_cli.polling.time.sleep"),
+            patch("pam_cli.auth.wait_for_login_success") as wait,
+        ):
+            self.assertTrue(_totp_accepted(page, totp_field, 10_000))
+        page.evaluate.assert_called_once_with(ANY, f"#{VAULT_ACCOUNTS_HASH}")
+        wait.assert_not_called()
 
     def test_a_dashboard_landing_after_a_totp_code(self):
         # TOTP first, then the dashboard, then the vault.
@@ -466,7 +550,7 @@ class DashboardLandingTests(unittest.TestCase):
             patch("pam_cli.auth._TOTP_REJECT_WINDOW_MS", 0),
         ):
             self.assertTrue(_totp_accepted(page, totp_field, 1000))
-        card.click.assert_called_once_with()
+        card.dispatch_event.assert_called_once_with("click")
 
 
 if __name__ == "__main__":
