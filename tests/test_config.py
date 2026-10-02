@@ -21,6 +21,7 @@ class ConfigTests(unittest.TestCase):
             "REQUEST_TAB_NAME": config.REQUEST_TAB_NAME,
             "REQUEST_SCOPE": config.REQUEST_SCOPE,
             "EXISTING_REQUEST_TEXT": config.EXISTING_REQUEST_TEXT,
+            "VAULT_ACCOUNTS_HASH": config.VAULT_ACCOUNTS_HASH,
         }
         for name, value in {**config.TEXT, **selectors}.items():
             with self.subTest(name):
