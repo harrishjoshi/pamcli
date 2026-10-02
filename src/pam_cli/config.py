@@ -3,6 +3,8 @@
 If the portal changes, this is the file to update; `pamcli discover`
 shows the login page's current fields."""
 
+import re
+
 # Labels/button text on the portal's login screens.
 TEXT = {
     "accept_button": "Accept",
@@ -12,6 +14,11 @@ TEXT = {
     "totp_heading": "TOTP - Enter Token",
     "totp_submit_button": "Submit",
 }
+
+# Some users land on an app dashboard after login instead of the vault. The
+# card that opens the vault is the one whose heading has the word
+# "password"; the dashboard's other cards don't.
+DASHBOARD_CARD_HEADING = re.compile(r"\bpassword\b", re.IGNORECASE)
 
 # The TOTP field. Its id changes on every page load, so it's found by its
 # name attribute.
