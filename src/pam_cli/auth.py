@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import urllib.parse
+import weakref
 from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
@@ -12,7 +13,12 @@ from playwright.sync_api import Locator, Page
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from pam_cli.blocker import install_input_blocker, remove_input_blocker
-from pam_cli.config import TEXT, TOTP_INPUT_SELECTOR
+from pam_cli.config import (
+    DASHBOARD_CARD_HEADING,
+    TEXT,
+    TOTP_INPUT_SELECTOR,
+    VAULT_ACCOUNTS_HASH,
+)
 from pam_cli.paths import write_private
 from pam_cli.polling import poll_until
 
@@ -123,6 +129,50 @@ def is_logged_in(page: Page) -> bool:
         return False
 
 
+def _is_app_dashboard(url: str) -> bool:
+    """True when the URL is the portal's app dashboard."""
+    route = urllib.parse.urlsplit(url).fragment.split("?", 1)[0].strip("/")
+    if route.startswith("!"):
+        route = route[1:].lstrip("/")
+    return route.lower() == "dashboard"
+
+
+# Pages already sent from the dashboard to the vault. Opening the vault
+# again reloads its Accounts page, so the tab takes much longer to appear.
+_left_dashboard: "weakref.WeakSet[Page]" = weakref.WeakSet()
+
+
+def _leave_dashboard_landing(page: Page) -> bool:
+    """If the portal is showing its app dashboard instead of the vault, open
+    the vault's Accounts page once and return True. Users who land on the
+    vault directly never see the dashboard, so for them this does nothing."""
+    if page in _left_dashboard:
+        return False
+    if _is_app_dashboard(page.url):
+        # Same document, new hash: the vault's Accounts page. A click would
+        # land on the layer that blocks manual input.
+        logger.debug("Opening the vault from the dashboard")
+        try:
+            page.evaluate("hash => { location.hash = hash }", f"#{VAULT_ACCOUNTS_HASH}")
+        except PlaywrightError as exc:
+            logger.debug("Dashboard navigation failed: %s", exc)
+        else:
+            _left_dashboard.add(page)
+            return True
+    heading = page.get_by_role("heading", name=DASHBOARD_CARD_HEADING)
+    card = page.get_by_role("link").filter(has=heading).first
+    try:
+        if not card.is_visible():
+            return False
+        logger.debug("Opening the vault from the dashboard card")
+        card.dispatch_event("click")
+    except PlaywrightError as exc:
+        logger.debug("Dashboard card check failed: %s", exc)
+        return False
+    _left_dashboard.add(page)
+    return True
+
+
 def wait_for_totp_or_success(page: Page, timeout_ms: int) -> str:
     """Wait for the TOTP screen ('totp') or the portal itself ('success')."""
     logger.debug("Waiting for the TOTP screen or the portal")
@@ -135,6 +185,7 @@ def wait_for_totp_or_success(page: Page, timeout_ms: int) -> str:
                 return "totp"
         except Exception as exc:
             logger.debug("TOTP heading check failed: %s", exc)
+        _leave_dashboard_landing(page)  # then check again
         return None
 
     outcome = poll_until(check, timeout_ms)
@@ -148,7 +199,14 @@ def wait_for_totp_or_success(page: Page, timeout_ms: int) -> str:
 
 def wait_for_login_success(page: Page, timeout_ms: int) -> None:
     logger.debug("Waiting for the portal")
-    if poll_until(lambda: is_logged_in(page) or None, timeout_ms) is None:
+
+    def check() -> bool | None:
+        if is_logged_in(page):
+            return True
+        _leave_dashboard_landing(page)
+        return None
+
+    if poll_until(check, timeout_ms) is None:
         raise PlaywrightTimeoutError(
             f"Did not detect a successful login in time. Last seen URL: {page.url}"
         )
@@ -227,9 +285,23 @@ def _totp_accepted(page: Page, totp_field: Locator, timeout_ms: int) -> bool:
     """After submitting a TOTP code, wait to see whether it worked.
 
     True once logged in; False if the TOTP field is still showing after a
-    short wait, meaning the code was rejected."""
+    short wait, meaning the code was rejected. The dashboard is opened during
+    this wait: otherwise a correct code that lands there sits until the wait
+    ends, because the Accounts tab is not on that page."""
     window_ms = min(_TOTP_REJECT_WINDOW_MS, timeout_ms)
-    if poll_until(lambda: is_logged_in(page) or None, window_ms):
+
+    def accepted() -> bool | None:
+        if is_logged_in(page):
+            return True
+        try:
+            if totp_field.is_visible():
+                return None  # the code is still on screen
+        except PlaywrightError as exc:
+            logger.debug("TOTP field check failed: %s", exc)
+        _leave_dashboard_landing(page)
+        return None
+
+    if poll_until(accepted, window_ms):
         return True
     if totp_field.is_visible():
         return False
