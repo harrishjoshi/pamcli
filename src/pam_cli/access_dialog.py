@@ -4,6 +4,7 @@ requesting the access."""
 import logging
 import re
 import sys
+from typing import Literal, overload
 
 from playwright.sync_api import Locator, Page
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -23,6 +24,13 @@ logger = logging.getLogger(__name__)
 
 # What each access type requests, as shown in the results.
 _REQUESTED = {"ssh": "SSH", "pass": "passkey", "both": "passkey and SSH"}
+DialogStatus = Literal["requested", "already_requested", "skipped", "not_confirmed"]
+
+
+def _outcome(
+    status: DialogStatus, message: str, with_status: bool
+) -> str | tuple[DialogStatus, str]:
+    return (status, message) if with_status else message
 
 
 def resolve_hours(cli_value: int | None) -> int:
@@ -125,18 +133,48 @@ def _check_switch(
         )
 
 
+@overload
+def request_access_in_dialog(
+    page: Page,
+    hours_value: int,
+    reason_value: str,
+    timeout_ms: int,
+    access: str = ...,
+    require_both: bool = ...,
+    with_status: Literal[False] = ...,
+) -> str: ...
+
+
+@overload
+def request_access_in_dialog(
+    page: Page,
+    hours_value: int,
+    reason_value: str,
+    timeout_ms: int,
+    access: str = ...,
+    require_both: bool = ...,
+    *,
+    with_status: Literal[True],
+) -> tuple[DialogStatus, str]: ...
+
+
 def request_access_in_dialog(
     page: Page,
     hours_value: int,
     reason_value: str,
     timeout_ms: int,
     access: str = DEFAULT_ACCESS,
-) -> str:
+    require_both: bool = False,
+    with_status: bool = False,
+) -> str | tuple[DialogStatus, str]:
     """Request `access` ("ssh", "pass" or "both") through the Submit Request
     tab, which never starts a session. Returns "requested (…)", "already
     requested (…)" (the existing request is kept; the dialog is cancelled),
-    "skipped (…)" if the account doesn't offer that access (the dialog is
-    cancelled) or "not confirmed (…)" if the dialog didn't close."""
+    "skipped (…)" if the account doesn't offer that access, or with
+    `require_both` doesn't offer both the passkey and SSH (the dialog is
+    cancelled), or "not confirmed (…)" if the dialog didn't close. With
+    `with_status`, returns (status, message) instead, so callers needn't
+    parse the message."""
     ssh_on = access in ("ssh", "both")
     passkey_on = access in ("pass", "both")
     existing = page.get_by_text(EXISTING_REQUEST_TEXT).first
@@ -149,8 +187,12 @@ def request_access_in_dialog(
         _cancel_dialog(page, timeout_ms)
         logger.debug("The account already has an active request")
         if valid_until:
-            return f"already requested (valid until {valid_until.group(1)})"
-        return "already requested"
+            return _outcome(
+                "already_requested",
+                f"already requested (valid until {valid_until.group(1)})",
+                with_status,
+            )
+        return _outcome("already_requested", "already requested", with_status)
 
     page.get_by_role("tab", name=REQUEST_TAB_NAME, exact=True).click(timeout=timeout_ms)
     form = page.locator(REQUEST_SCOPE)
@@ -171,6 +213,10 @@ def request_access_in_dialog(
         (SSH_SWITCH_NAME, "SSH", ssh_on),
     )
     try:
+        if require_both:
+            for label, what, _ in switches:
+                if _switch(form, label).count() == 0:
+                    raise _NotOffered(what)
         for label, what, on in switches:
             _set_switch(form, label, what, on, timeout_ms)
         for label, what, on in switches:
@@ -178,7 +224,12 @@ def request_access_in_dialog(
     except _NotOffered as missing:
         # Nothing was submitted: cancel, and make sure the dialog closed so
         # the next IP can go ahead.
-        logger.warning("The account offers no %s access; skipping it", missing.what)
+        # With require_both the caller tries another row, and warns itself.
+        logger.log(
+            logging.DEBUG if require_both else logging.WARNING,
+            "The account offers no %s access; skipping it",
+            missing.what,
+        )
         _cancel_dialog(page, timeout_ms)
         try:
             form.wait_for(state="hidden", timeout=timeout_ms)
@@ -186,7 +237,11 @@ def request_access_in_dialog(
             raise RuntimeError(
                 "The Access dialog didn't close after Cancel; stopping."
             ) from exc
-        return f"skipped (no {missing.what} access for this account)"
+        return _outcome(
+            "skipped",
+            f"skipped (no {missing.what} access for this account)",
+            with_status,
+        )
 
     logger.debug("Requesting the access")
     submit = form.get_by_role("button", name=REQUEST_TAB_NAME, exact=True)
@@ -204,5 +259,9 @@ def request_access_in_dialog(
     except PlaywrightTimeoutError:
         logger.warning("The Access dialog stayed open after %s", REQUEST_TAB_NAME)
         _cancel_dialog(page, timeout_ms)
-        return "not confirmed (the Access dialog stayed open)"
-    return f"requested ({_REQUESTED[access]})"
+        return _outcome(
+            "not_confirmed",
+            "not confirmed (the Access dialog stayed open)",
+            with_status,
+        )
+    return _outcome("requested", f"requested ({_REQUESTED[access]})", with_status)

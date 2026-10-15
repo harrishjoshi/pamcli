@@ -212,6 +212,34 @@ class RequestAccessInDialogTests(unittest.TestCase):
                 )
                 ui.form.wait_for.assert_called_once_with(state="hidden", timeout=5000)
 
+    def test_require_both_skips_a_dialog_without_both_switches(self):
+        # Even when the access asked for doesn't need the missing switch.
+        for access, missing, what in (
+            ("pass", SSH_SWITCH_NAME, "SSH"),
+            ("ssh", PASSKEY_SWITCH_NAME, "passkey"),
+        ):
+            with self.subTest(access=access):
+                ui = self._dialog(missing=(missing,))
+                with self.assertNoLogs("pam_cli", "WARNING"):
+                    outcome = request_access_in_dialog(
+                        ui.page, 4, "x", 5000, access=access, require_both=True
+                    )
+                self.assertEqual(
+                    outcome, f"skipped (no {what} access for this account)"
+                )
+                ui.submit.click.assert_not_called()
+                ui.ssh_switch.click.assert_not_called()
+                ui.passkey_switch.click.assert_not_called()
+
+    def test_require_both_requests_when_both_switches_are_there(self):
+        ui = self._dialog()
+        self.assertEqual(
+            request_access_in_dialog(
+                ui.page, 4, "x", 5000, access="pass", require_both=True
+            ),
+            "requested (passkey)",
+        )
+
     def test_a_skip_whose_dialog_stays_open_stops_the_run(self):
         ui = self._dialog(missing=(PASSKEY_SWITCH_NAME,))
         ui.form.wait_for.side_effect = PlaywrightTimeoutError("open")

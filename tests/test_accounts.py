@@ -9,9 +9,11 @@ from playwright.sync_api import Error as PlaywrightError
 from pam_cli.accounts import (
     _access_cell,
     _close_tab,
+    _find_account,
+    _mark_copies,
     _prompt_for_ips,
+    _request_account,
     _rows_for_ip,
-    _select_and_access_one,
     open_directory_linked_accounts,
     request_access,
     select_account_and_access,
@@ -19,18 +21,25 @@ from pam_cli.accounts import (
     type_quick_filter,
     wait_for_grid_settled,
 )
-from pam_cli.config import ACCOUNT_NAME_CELL_SELECTOR
+from pam_cli.config import ACCOUNT_NAME_CELL_SELECTOR, DIRECTORY_CELL_SELECTOR
 from pam_cli.environments import EnvironmentConfig, IPTarget
 
 
 def _grid_page(rows_spec):
-    """A page whose grid has one row per (account name, full row text)."""
+    """A page whose grid has one row per (account name, full row text) or
+    (account name, full row text, directory); without a directory, the
+    directory column is hidden."""
     page = MagicMock()
     rows = []
-    for account, text in rows_spec:
+    for account, text, *directory in rows_spec:
         row = MagicMock()
         row.inner_text.return_value = text
-        row.locator.return_value.inner_text.return_value = account
+        cells = {ACCOUNT_NAME_CELL_SELECTOR: MagicMock()}
+        cells[ACCOUNT_NAME_CELL_SELECTOR].inner_text.return_value = account
+        cells[DIRECTORY_CELL_SELECTOR] = MagicMock()
+        cells[DIRECTORY_CELL_SELECTOR].count.return_value = len(directory)
+        cells[DIRECTORY_CELL_SELECTOR].inner_text.side_effect = directory
+        row.locator.side_effect = cells.__getitem__
         rows.append(row)
     page.locator.return_value.nth.side_effect = rows.__getitem__
     return page, rows
@@ -53,21 +62,21 @@ class NavigationTests(unittest.TestCase):
         )
 
 
-class SelectAndAccessOneTests(unittest.TestCase):
+class FindAccountTests(unittest.TestCase):
     def _select(self, rows_spec, account=None, ip="10.0.0.1"):
+        """The account found and whether one was (None, False if not)."""
+        found = self._find(rows_spec, account, ip)
+        return (found[0], True) if found else (None, False)
+
+    def _find(self, rows_spec, account=None, ip="10.0.0.1"):
         page, _ = _grid_page(rows_spec)
         with (
             patch("pam_cli.accounts.type_quick_filter"),
             patch(
                 "pam_cli.accounts.wait_for_grid_settled", return_value=len(rows_spec)
             ),
-            patch("pam_cli.accounts._access_cell") as access_cell,
         ):
-            found = _select_and_access_one(page, ip, account, 1000)
-        clicked = access_cell.return_value.click.called
-        if clicked:
-            access_cell.assert_called_once_with(page, ip, found)
-        return found, clicked
+            return _find_account(page, ip, account, 1000)
 
     def test_only_rows_with_exactly_the_ip_count(self):
         # The Quick filter matches substrings: 10.0.0.1 also shows .15/.100.
@@ -109,6 +118,64 @@ class SelectAndAccessOneTests(unittest.TestCase):
         ):
             self._select(rows, account="app")
 
+    def test_an_account_on_several_rows_is_one_account(self):
+        # The portal can list an account twice, each row offering different
+        # access types: that's one match, with the number of its rows.
+        rows = [
+            ("svc.app01", "svc.app01 10.0.0.1"),
+            ("root", "root 10.0.0.1"),
+            ("svc.app01", "svc.app01 10.0.0.1"),
+        ]
+        self.assertEqual(self._find(rows, account="app01"), ("svc.app01", 2))
+        self.assertEqual(self._find(rows), ("svc.app01", 2))
+        self.assertEqual(self._find(rows, account="root"), ("root", 1))
+
+    def test_one_name_in_different_directories_raises(self):
+        # Two accounts sharing a name aren't merged into one, with or
+        # without -a, wherever the directory column sits in the row.
+        rows = [
+            ("svc.app01", "dir-a svc.app01 10.0.0.1", "dir-a"),
+            ("svc.app01", "svc.app01 10.0.0.1 dir-b", "dir-b"),
+        ]
+        for account in ("svc.app01", None):
+            with (
+                self.subTest(account=account),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "2 rows for 10.0.0.1 show account 'svc.app01' as different "
+                    "accounts",
+                ),
+            ):
+                self._find(rows, account=account)
+
+    def test_rows_in_one_directory_are_one_account_whatever_their_status(self):
+        # Other columns, e.g. the status, can differ between the copies.
+        rows = [
+            ("svc.app01", "dir-a svc.app01 Available 10.0.0.1", "dir-a"),
+            ("svc.app01", "dir-a  svc.app01 In use 10.0.0.1", " dir-a "),
+        ]
+        self.assertEqual(self._find(rows), ("svc.app01", 2))
+
+    def test_without_a_directory_column_the_whole_row_is_compared(self):
+        same = [("svc.app01", "svc.app01 10.0.0.1")] * 2
+        self.assertEqual(self._find(same), ("svc.app01", 2))
+        differ = [
+            ("svc.app01", "svc.app01 10.0.0.1 Available"),
+            ("svc.app01", "svc.app01 10.0.0.1 In use"),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "as different accounts"):
+            self._find(differ)
+
+    def test_case_distinct_names_stay_ambiguous(self):
+        rows = [
+            ("svc.app01", "svc.app01 10.0.0.1"),
+            ("SVC.app01", "SVC.app01 10.0.0.1"),
+        ]
+        with self.assertRaisesRegex(
+            RuntimeError, "2 accounts match 'app01' \\(svc.app01, SVC.app01\\)"
+        ):
+            self._select(rows, account="app01")
+
     def test_unmatched_account_raises_instead_of_picking_first_row(self):
         with self.assertRaisesRegex(RuntimeError, "No account matching 'nope'"):
             self._select([("app01", "10.0.0.1")], account="nope")
@@ -127,12 +194,171 @@ class AccessCellTests(unittest.TestCase):
         name_call = page.locator.call_args_list[0]
         self.assertEqual(name_call.args, (ACCOUNT_NAME_CELL_SELECTOR,))
         name = name_call.kwargs["has_text"]
-        self.assertTrue(name.search(" SVC.app01 "))
-        for other in ("svc.app011", "x svc.app01"):
+        self.assertTrue(name.search(" svc.app01 "))
+        for other in (" SVC.app01 ", "svc.app011", "x svc.app01"):
             self.assertIsNone(name.search(other), other)
         grid.filter.return_value.filter.assert_called_once_with(
             has=page.locator.return_value
         )
+        # A single row isn't picked by position: two would make the click fail.
+        rows = grid.filter.return_value.filter.return_value
+        rows.nth.assert_not_called()
+        rows.and_.assert_not_called()
+
+    def test_copy_picks_the_marked_row_not_a_position(self):
+        page = MagicMock()
+        _access_cell(page, "10.0.0.1", "svc.app01", 1)
+        rows = page.locator.return_value.filter.return_value.filter.return_value
+        rows.nth.assert_not_called()
+        page.locator.assert_any_call("[data-pamcli-copy='1']")
+        rows.and_.assert_called_once_with(page.locator.return_value)
+
+
+class MarkCopiesTests(unittest.TestCase):
+    def _rows(self, count):
+        page = MagicMock()
+        rows = page.locator.return_value.filter.return_value.filter.return_value
+        rows.count.return_value = count
+        return page, rows
+
+    def test_numbers_each_row_of_the_account(self):
+        page, rows = self._rows(2)
+        _mark_copies(page, "10.0.0.1", "app", 2, 1000)
+        self.assertEqual([c.args for c in rows.nth.call_args_list], [(0,), (1,)])
+        self.assertEqual(
+            [c.args[1] for c in rows.nth.return_value.evaluate.call_args_list], [0, 1]
+        )
+        self.assertIn(
+            "data-pamcli-copy", rows.nth.return_value.evaluate.call_args.args[0]
+        )
+
+    def test_a_grid_that_changed_since_it_was_read_stops(self):
+        page, rows = self._rows(3)
+        with self.assertRaisesRegex(RuntimeError, "grid changed"):
+            _mark_copies(page, "10.0.0.1", "app", 2, 1000)
+        rows.nth.assert_not_called()
+
+
+class RequestAccountTests(unittest.TestCase):
+    SKIPPED_SSH = ("skipped", "skipped (no SSH access for this account)")
+    SKIPPED_PASSKEY = ("skipped", "skipped (no passkey access for this account)")
+
+    def setUp(self):
+        for name in ("_access_cell", "_mark_copies"):
+            patcher = patch(f"pam_cli.accounts.{name}")
+            setattr(self, name.lstrip("_"), patcher.start())
+            self.addCleanup(patcher.stop)
+        # Each marked row is found once, as when the grid hasn't changed.
+        self.access_cell.return_value.count.return_value = 1
+
+    def _request(self, copies, outcomes, access="ssh"):
+        page = MagicMock()
+        with patch(
+            "pam_cli.accounts.request_access_in_dialog", side_effect=outcomes
+        ) as dialog:
+            outcome = _request_account(
+                page, "10.0.0.1", "app", copies, 4, "UAT", access, 1000
+            )
+        return page, outcome, dialog
+
+    def test_a_single_row_is_requested_as_it_is(self):
+        page, outcome, dialog = self._request(1, ["requested (SSH)"])
+        self.assertEqual(outcome, "requested (SSH)")
+        self.access_cell.assert_called_once_with(page, "10.0.0.1", "app")
+        dialog.assert_called_once_with(page, 4, "UAT", 1000, access="ssh")
+        self.mark_copies.assert_not_called()
+
+    def test_several_rows_use_the_one_offering_both(self):
+        # For "both", rows missing one switch are skipped until one offers
+        # both passkey and SSH.
+        page, outcome, dialog = self._request(
+            2,
+            [self.SKIPPED_SSH, ("requested", "requested (passkey and SSH)")],
+            access="both",
+        )
+        self.assertEqual(outcome, "requested (passkey and SSH)")
+        self.mark_copies.assert_called_once_with(page, "10.0.0.1", "app", 2, 1000)
+        self.assertEqual([c.args[3] for c in self.access_cell.call_args_list], [0, 1])
+        self.assertEqual(self.access_cell.return_value.click.call_count, 2)
+        for c in dialog.call_args_list:
+            self.assertEqual(
+                c.kwargs,
+                {"access": "both", "require_both": True, "with_status": True},
+            )
+
+    def test_single_access_does_not_require_both_switches(self):
+        _, outcome, dialog = self._request(
+            2,
+            [self.SKIPPED_PASSKEY, ("requested", "requested (passkey)")],
+            access="pass",
+        )
+        self.assertEqual(outcome, "requested (passkey)")
+        self.assertEqual([c.args[3] for c in self.access_cell.call_args_list], [0, 1])
+        for c in dialog.call_args_list:
+            self.assertEqual(
+                c.kwargs,
+                {"access": "pass", "require_both": False, "with_status": True},
+            )
+
+    def test_stops_at_the_first_row_that_takes_the_request(self):
+        _, outcome, dialog = self._request(2, [("requested", "requested (SSH)")])
+        self.assertEqual(outcome, "requested (SSH)")
+        dialog.assert_called_once()
+
+    def test_skipped_with_a_warning_when_no_row_offers_both(self):
+        with self.assertLogs("pam_cli", "WARNING") as logs:
+            _, outcome, dialog = self._request(
+                2, [self.SKIPPED_SSH, self.SKIPPED_SSH], access="both"
+            )
+        self.assertEqual(outcome, "skipped (no row offers both the passkey and SSH)")
+        self.assertEqual(dialog.call_count, 2)
+        self.assertIn("None of the 2 rows for the account", logs.output[-1])
+        # The account and IP are already in the log and results; not repeated.
+        self.assertNotIn("10.0.0.1", logs.output[-1])
+
+    def test_an_active_request_ends_the_search(self):
+        # The first row already has an active request: the second row isn't
+        # requested, even if it offers both too.
+        _, outcome, dialog = self._request(
+            2,
+            [
+                ("already_requested", "already requested"),
+                ("requested", "requested (SSH)"),
+            ],
+        )
+        self.assertEqual(outcome, "already requested")
+        dialog.assert_called_once()
+
+    def test_an_active_request_on_a_later_row_is_reported(self):
+        _, outcome, _ = self._request(
+            2,
+            [self.SKIPPED_SSH, ("already_requested", "already requested")],
+        )
+        self.assertEqual(outcome, "already requested")
+
+    def test_not_confirmed_ends_the_search(self):
+        _, outcome, dialog = self._request(
+            2,
+            [
+                ("not_confirmed", "not confirmed (the Access dialog stayed open)"),
+                ("requested", "requested (SSH)"),
+            ],
+        )
+        self.assertEqual(outcome, "not confirmed (the Access dialog stayed open)")
+        dialog.assert_called_once()
+
+    def test_a_row_redrawn_by_the_grid_stops_instead_of_guessing(self):
+        # Its mark is gone, so it can't be told from the rows already tried.
+        for found in (0, 2):
+            with self.subTest(found=found):
+                self.access_cell.return_value.count.return_value = found
+                with self.assertRaisesRegex(RuntimeError, "grid changed"):
+                    self._request(2, [])
+                self.access_cell.return_value.click.assert_not_called()
+
+    def test_invalid_copy_count_raises(self):
+        with self.assertRaisesRegex(ValueError, "Invalid row count 0"):
+            _request_account(MagicMock(), "10.0.0.1", "app", 0, 4, "UAT", "ssh", 1000)
 
 
 @patch("pam_cli.polling.time.sleep")
@@ -290,6 +516,14 @@ class QuickFilterTests(unittest.TestCase):
         quick_filter.press_sequentially.assert_called_once_with("10.0.0.1", delay=30)
 
 
+def _found(found):
+    """What _find_account returns for an account name (one row each), a
+    list of them, or None and errors as they are."""
+    if isinstance(found, list):
+        return [_found(f) for f in found]
+    return (found, 1) if isinstance(found, str) else found
+
+
 class SelectAccountAndAccessTests(unittest.TestCase):
     def _run(
         self, targets, found="svc.app0", account="svc.app0", access=None, outcomes=None
@@ -302,12 +536,12 @@ class SelectAccountAndAccessTests(unittest.TestCase):
                 "pam_cli.accounts.resolve_reason", return_value="UAT"
             ) as self.ask_reason,
             patch(
-                "pam_cli.accounts._select_and_access_one",
-                side_effect=found if isinstance(found, list) else None,
-                return_value=found,
+                "pam_cli.accounts._find_account",
+                side_effect=_found(found) if isinstance(found, list) else None,
+                return_value=_found(found),
             ) as select,
             patch(
-                "pam_cli.accounts.request_access_in_dialog",
+                "pam_cli.accounts._request_account",
                 side_effect=outcomes,
                 return_value="requested",
             ) as start,
@@ -330,7 +564,7 @@ class SelectAccountAndAccessTests(unittest.TestCase):
             [("10.0.0.1", "svc.app0"), ("10.0.0.2", "db01")],
         )
         self.assertEqual(
-            [c.args[1:3] for c in start.call_args_list], [(4, "UAT"), (2, "db")]
+            [c.args[4:6] for c in start.call_args_list], [(4, "UAT"), (2, "db")]
         )
 
     def test_access_per_target_beats_the_run_value(self):
@@ -348,16 +582,14 @@ class SelectAccountAndAccessTests(unittest.TestCase):
         ):
             with self.subTest(access=access):
                 _, _, start = self._run(targets, access=access)
-                self.assertEqual(
-                    [c.kwargs["access"] for c in start.call_args_list], expected
-                )
+                self.assertEqual([c.args[6] for c in start.call_args_list], expected)
 
     def test_no_prompt_when_every_target_sets_its_own_values(self):
         targets = [IPTarget(ip="10.0.0.1", hours=2, reason="db")]
         _, _, start = self._run(targets)
         self.ask_hours.assert_not_called()
         self.ask_reason.assert_not_called()
-        self.assertEqual(start.call_args.args[1:3], (2, "db"))
+        self.assertEqual(start.call_args.args[4:6], (2, "db"))
 
     def test_prints_a_result_per_ip_then_shows_requests(self):
         # The second IP has no accounts: it's skipped, the batch carries on.
@@ -414,7 +646,7 @@ class SelectAccountAndAccessTests(unittest.TestCase):
                 self.subTest(error.__name__),
                 patch("pam_cli.accounts.open_directory_linked_accounts"),
                 patch("pam_cli.accounts.resolve_hours", side_effect=error),
-                patch("pam_cli.accounts._select_and_access_one") as select,
+                patch("pam_cli.accounts._find_account") as select,
                 patch("builtins.print"),
             ):
                 result = select_account_and_access(
