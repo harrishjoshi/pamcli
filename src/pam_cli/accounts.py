@@ -17,6 +17,7 @@ from pam_cli.config import (
     ACCESS_CELL_SELECTOR,
     ACCOUNT_NAME_CELL_SELECTOR,
     DEFAULT_ACCESS,
+    DIRECTORY_CELL_SELECTOR,
     GRID_ROW_SELECTOR,
 )
 from pam_cli.environments import EnvironmentConfig, IPTarget, parse_ip_list
@@ -158,35 +159,89 @@ def _account_name(row: Locator, timeout_ms: int) -> str:
 
 def _matching_accounts(names: list[str], account: str) -> list[str]:
     """The account names that match: the exact name (ignoring case) if it's
-    there, else every name containing it (e.g. 'app01' in 'svc.app01')."""
+    there, else every name containing it (e.g. 'app01' in 'svc.app01').
+    The same spelling shown on several rows is listed once."""
     wanted = account.strip().lower()
     exact = [name for name in names if name.lower() == wanted]
-    return exact or [name for name in names if wanted in name.lower()]
+    return list(
+        dict.fromkeys(exact or [name for name in names if wanted in name.lower()])
+    )
 
 
-def _access_cell(page: Page, ip: str, name: str) -> Locator:
-    """The Access cell of the row for this IP and account, found by what
-    the row shows rather than its position, so a grid that re-renders
-    can't move the click onto another server or account."""
+# Set on each row of an account listed several times, so a retry clicks the
+# row it means even if the grid reorders them. pamcli's own, not the portal's.
+_COPY_ATTRIBUTE = "data-pamcli-copy"
+
+
+def _account_rows(page: Page, ip: str, name: str) -> Locator:
+    """The rows for this IP and account, found by what they show rather than
+    their position, so a grid that re-renders can't move a click onto
+    another server or account."""
     name_cell = page.locator(
         ACCOUNT_NAME_CELL_SELECTOR,
-        has_text=re.compile(rf"^\s*{re.escape(name)}\s*$", re.IGNORECASE),
+        has_text=re.compile(rf"^\s*{re.escape(name)}\s*$"),
     )
-    row = (
+    return (
         page.locator(GRID_ROW_SELECTOR)
         .filter(has_text=_exact_ip(ip))
         .filter(has=name_cell)
     )
+
+
+def _access_cell(page: Page, ip: str, name: str, copy: int | None = None) -> Locator:
+    """The Access cell of the row for this IP and account. `copy` picks one
+    of the rows marked by _mark_copies when the account has several."""
+    row = _account_rows(page, ip, name)
+    if copy is not None:
+        row = row.and_(page.locator(f"[{_COPY_ATTRIBUTE}='{copy}']"))
     return row.locator(ACCESS_CELL_SELECTOR)
 
 
-def _select_and_access_one(
-    page: Page, ip_filter: str, account: str | None, timeout_ms: int
-) -> str | None:
-    """Filter the grid to one IP and click Access on the right row.
+def _mark_copies(page: Page, ip: str, name: str, copies: int, timeout_ms: int) -> None:
+    """Number the account's rows, so each is tried once even if the grid
+    reorders them while the others are tried."""
+    rows = _account_rows(page, ip, name)
+    if rows.count() != copies:
+        raise _grid_changed_error()
+    for copy in range(copies):
+        rows.nth(copy).evaluate(
+            f"(row, copy) => row.setAttribute('{_COPY_ATTRIBUTE}', String(copy))",
+            copy,
+            timeout=timeout_ms,
+        )
 
-    Returns the account name used, or None if the IP has no accounts. Raises
-    if the requested account isn't there, or several accounts match it,
+
+def _grid_changed_error() -> RuntimeError:
+    return RuntimeError(
+        "The accounts grid changed while its rows for this account were being "
+        "tried; nothing more was requested for it."
+    )
+
+
+def _row_text(row: Locator, timeout_ms: int) -> str:
+    return " ".join(row.inner_text(timeout=timeout_ms).split())
+
+
+def _row_identity(row: Locator, timeout_ms: int) -> str:
+    """What tells this row's account from another with the same name: its
+    directory. Other columns, such as the status, can differ between rows
+    of one account. If the directory column is hidden, the whole row is
+    compared instead, so accounts are never merged on a guess."""
+    directory = row.locator(DIRECTORY_CELL_SELECTOR)
+    if directory.count() == 0:
+        return _row_text(row, timeout_ms)
+    return " ".join(directory.inner_text(timeout=timeout_ms).split())
+
+
+def _find_account(
+    page: Page, ip_filter: str, account: str | None, timeout_ms: int
+) -> tuple[str, int] | None:
+    """Filter the grid to one IP and find the account to request.
+
+    Returns the account name and how many rows show it (the portal can list
+    the same account more than once, each row offering different access
+    types), or None if the IP has no accounts. Raises if the requested
+    account isn't there, several accounts match it, or its rows differ,
     rather than picking another one."""
     type_quick_filter(page, ip_filter, timeout_ms)
     row_count = wait_for_grid_settled(page, ip_filter, timeout_ms)
@@ -213,9 +268,70 @@ def _select_and_access_one(
             )
         name = matches[0]
 
+    # Rows count as one account only if they're in the same directory, so
+    # two accounts sharing a name in different directories aren't merged.
+    same = [row for row, other in zip(rows, names) if other == name]
+    if len({_row_identity(row, timeout_ms) for row in same}) > 1:
+        raise RuntimeError(
+            f"{len(same)} rows for {ip_filter} show account {name!r} as "
+            "different accounts (e.g. in different directories), so which one "
+            "to request is unclear; nothing was requested for it."
+        )
     logger.info("Using account %s for %s", name, ip_filter)
-    _access_cell(page, ip_filter, name).click(timeout=timeout_ms)
-    return name
+    return name, len(same)
+
+
+def _request_account(
+    page: Page,
+    ip: str,
+    name: str,
+    copies: int,
+    hours: int,
+    reason: str,
+    access: str,
+    timeout_ms: int,
+) -> str:
+    """Click Access on the account's row and request the access there.
+
+    The portal can list an account on several rows, each offering different
+    access types. Then each row is tried in turn until one takes the request.
+    For `both`, only a row offering both switches is accepted. The first row
+    with an active request ends the search, so the account is never requested
+    twice."""
+    if copies < 1:
+        raise ValueError(f"Invalid row count {copies} for account {name!r}")
+    if copies == 1:
+        _access_cell(page, ip, name).click(timeout=timeout_ms)
+        return request_access_in_dialog(page, hours, reason, timeout_ms, access=access)
+
+    require_both = access == "both"
+    _mark_copies(page, ip, name, copies, timeout_ms)
+    for copy in range(copies):
+        logger.info("Trying row %d of %d for the account", copy + 1, copies)
+        cell = _access_cell(page, ip, name, copy)
+        # A row the grid has drawn again has lost its mark: stop, not guess.
+        if cell.count() != 1:
+            raise _grid_changed_error()
+        cell.click(timeout=timeout_ms)
+        status, outcome = request_access_in_dialog(
+            page,
+            hours,
+            reason,
+            timeout_ms,
+            access=access,
+            require_both=require_both,
+            with_status=True,
+        )
+        if status != "skipped":
+            return outcome
+    if require_both:
+        logger.warning(
+            "None of the %d rows for the account offers both the passkey and "
+            "SSH; skipping it",
+            copies,
+        )
+        return "skipped (no row offers both the passkey and SSH)"
+    return outcome
 
 
 def _first_set(*values: T | None) -> T:
@@ -279,16 +395,20 @@ def _request_all(
         logger.info("Requesting access %d/%d: %s", index, len(targets), target.ip)
         account = target.account if target.account is not None else default_account
         try:
-            name = _select_and_access_one(page, target.ip, account, timeout_ms)
-            if name is None:
+            found = _find_account(page, target.ip, account, timeout_ms)
+            if found is None:
                 results.append((target.ip, "—", "no accounts, skipped"))
                 continue
-            outcome = request_access_in_dialog(
+            name, copies = found
+            outcome = _request_account(
                 page,
+                target.ip,
+                name,
+                copies,
                 _first_set(target.hours, hours),
                 _first_set(target.reason, reason),
+                _first_set(target.access, access, DEFAULT_ACCESS),
                 timeout_ms,
-                access=_first_set(target.access, access, DEFAULT_ACCESS),
             )
         except Exception as exc:
             # Earlier IPs may already be requested: show them before stopping.

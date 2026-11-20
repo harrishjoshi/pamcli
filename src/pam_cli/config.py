@@ -35,6 +35,9 @@ DEFAULT_TIMEOUT_MS = 30_000
 # ":visible" skips rows the Quick filter has hidden.
 GRID_ROW_SELECTOR = "tr.grid__row:visible"
 ACCOUNT_NAME_CELL_SELECTOR = "td[data-column-id='AccountName']"
+# The account's directory (domain): with the account name, what tells one
+# account from another that has the same name.
+DIRECTORY_CELL_SELECTOR = "td[data-column-id='AccountDomainName']"
 ACCESS_CELL_SELECTOR = "td[data-column-id='AccessButton']"
 
 # The Access dialog's Submit Request tab, which only requests access. Every
